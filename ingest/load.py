@@ -14,12 +14,27 @@ import duckdb
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = ["usage_date", "api_key_id", "model", "tokens", "cost_usd"]
 
+# Vendor exports sometimes rename a column. Map the canonical name to the alternate
+# names we've seen so a renamed column doesn't stop the load, as long as one of them
+# is present.
+ALIASES = {"cost_usd": ["cost"]}
+
+
+def resolve_column(header: list[str], canonical: str) -> str | None:
+    """Return the column in `header` that supplies `canonical`, or None if absent."""
+    if canonical in header:
+        return canonical
+    for alt in ALIASES.get(canonical, []):
+        if alt in header:
+            return alt
+    return None
+
 
 def check_columns(files: list[Path]) -> None:
     for path in files:
         with path.open() as f:
             header = next(csv.reader(f))
-        missing = [c for c in REQUIRED if c not in header]
+        missing = [c for c in REQUIRED if resolve_column(header, c) is None]
         if missing:
             raise SystemExit(f"{path.name}: missing column(s) {', '.join(missing)}; found {', '.join(header)}")
 
@@ -35,14 +50,21 @@ def load(db: str, landing: Path, reference: Path, through: str | None = None) ->
     con = duckdb.connect(db)
     con.execute("create schema if not exists raw")
     con.execute("create schema if not exists finance")
-    file_list = ", ".join(f"'{f}'" for f in files)
-    con.execute(f"""
-        create or replace table raw.azure_openai_usage as
-        select usage_date::date as usage_date, api_key_id, model, tokens::bigint as tokens,
-               cost_usd::decimal(12, 2) as cost_usd,
-               regexp_extract(filename, '([^/]+)\\.csv$', 1) as _load_id
-        from read_csv([{file_list}], filename = true, header = true, all_varchar = true)
-    """)
+
+    selects = []
+    for f in files:
+        with f.open() as fh:
+            header = next(csv.reader(fh))
+        cost_col = resolve_column(header, "cost_usd")
+        load_id = f.name[: -len(".csv")] if f.name.endswith(".csv") else f.name
+        selects.append(f"""
+            select usage_date::date as usage_date, api_key_id, model, tokens::bigint as tokens,
+                   "{cost_col}"::decimal(12, 2) as cost_usd,
+                   '{load_id}' as _load_id
+            from read_csv('{f}', header = true, all_varchar = true)
+        """)
+    con.execute("create or replace table raw.azure_openai_usage as " + " union all ".join(selects))
+
     for table, file in [
         ("raw.api_keys", "api_keys.csv"),
         ("raw.m365_copilot_seats", "m365_copilot_seats.csv"),

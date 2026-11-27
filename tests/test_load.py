@@ -44,7 +44,18 @@ def test_through_stops_at_the_given_day(dirs):
 
 def test_a_file_missing_a_column_stops_the_load_and_says_which(dirs):
     landing, reference, db = dirs
-    renamed = ["usage_date", "api_key_id", "model", "tokens", "cost"]
+    renamed = ["usage_date", "api_key_id", "model", "tokens", "price"]
     write(landing / "2026-07-01.csv", renamed, [["2026-07-01", "key-a", "gpt-4o", 1000, "0.50"]])
     with pytest.raises(SystemExit, match="missing column.*cost_usd"):
         load(db, landing, reference)
+
+
+def test_a_known_renamed_cost_column_still_loads(dirs):
+    # The vendor export has renamed cost_usd to cost before (DATA-11); a file using
+    # that known alias should still load instead of stopping the run.
+    landing, reference, db = dirs
+    renamed = ["usage_date", "api_key_id", "model", "tokens", "cost"]
+    write(landing / "2026-07-01.csv", renamed, [["2026-07-01", "key-a", "gpt-4o", 1000, "0.50"]])
+    assert load(db, landing, reference) == 1
+    row = duckdb.connect(db).execute("select cost_usd from raw.azure_openai_usage").fetchone()
+    assert row == (0.50,)
